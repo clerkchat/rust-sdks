@@ -14,11 +14,18 @@
 
 #[cfg(feature = "__lk-e2e-test")]
 use {
-    anyhow::{Ok, Result},
+    anyhow::{anyhow, Ok, Result},
     chrono::{TimeDelta, TimeZone, Utc},
     common::test_rooms,
-    libwebrtc::prelude::PeerConnectionState,
-    livekit::{ConnectionState, ParticipantKind, RoomEvent},
+    libwebrtc::{
+        audio_source::native::NativeAudioSource,
+        prelude::{AudioSourceOptions, PeerConnectionState, RtcAudioSource},
+    },
+    livekit::{
+        options::TrackPublishOptions,
+        track::{LocalAudioTrack, LocalTrack},
+        ConnectionState, ParticipantKind, RoomEvent,
+    },
     std::time::Duration,
     tokio::time::{self, timeout},
 };
@@ -138,6 +145,67 @@ async fn test_close_releases_room_session() -> Result<()> {
     drop(room);
 
     assert!(session_dropped(), "room callbacks retained the room session after close");
+    Ok(())
+}
+
+/// Closing and dropping a room must release remote participants still in it, and their
+/// subscribed publications.
+///
+/// Callbacks a participant stores on its own publications, and a publication on its own track,
+/// must not strongly capture their owner. Such a cycle is only broken when the participant leaves
+/// while we are connected, so every participant still present at close would leak.
+#[cfg(feature = "__lk-e2e-test")]
+#[test_log::test(tokio::test)]
+async fn test_close_releases_remote_participants() -> Result<()> {
+    let mut rooms = test_rooms(2).await?;
+    let (pub_room, _) = rooms.pop().unwrap();
+    let (sub_room, mut sub_events) = rooms.pop().unwrap();
+
+    let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 1, 1000);
+    let track = LocalAudioTrack::create_audio_track("audio", RtcAudioSource::Native(source));
+    pub_room
+        .local_participant()
+        .publish_track(LocalTrack::Audio(track), TrackPublishOptions::default())
+        .await?;
+
+    // Subscribed, so the publication holds a track and both kinds of callback are registered.
+    let (participant_dropped, publication_dropped) = timeout(Duration::from_secs(10), async {
+        while let Some(event) = sub_events.recv().await {
+            if let RoomEvent::TrackSubscribed { participant, publication, .. } = event {
+                return Ok((participant.drop_probe(), publication.drop_probe()));
+            }
+        }
+        Err(anyhow!("event channel closed before TrackSubscribed"))
+    })
+    .await??;
+
+    let session_dropped = sub_room.drop_probe();
+    sub_room.close().await?;
+    // Queued events hold participant and publication clones.
+    drop(sub_events);
+    drop(sub_room);
+    assert!(session_dropped(), "room session retained after close");
+
+    let released = |probe: Box<dyn Fn() -> bool>| async move {
+        timeout(Duration::from_secs(10), async {
+            while !probe() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    };
+    assert!(
+        released(Box::new(participant_dropped)).await,
+        "remote participant retained after room close"
+    );
+    assert!(
+        released(Box::new(publication_dropped)).await,
+        "remote publication retained after room close"
+    );
+
+    // Still connected until now, so the participant was present when the other side closed.
+    pub_room.close().await?;
     Ok(())
 }
 

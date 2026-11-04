@@ -178,6 +178,33 @@ pub(super) fn update_info(
         .collect();
 }
 
+/// How callbacks stored on a publication's own track refer to that publication.
+#[derive(Clone)]
+enum CallbackPublication {
+    /// Strong, but not a leak: `close` unpublishes local tracks, which clears these callbacks.
+    Local(LocalTrackPublication),
+    /// Weak, since a remote participant still present at close never has its tracks cleared.
+    Remote(WeakRemoteTrackPublication),
+}
+
+impl CallbackPublication {
+    fn get(&self) -> Option<TrackPublication> {
+        match self {
+            CallbackPublication::Local(p) => Some(TrackPublication::Local(p.clone())),
+            CallbackPublication::Remote(p) => p.upgrade().map(TrackPublication::Remote),
+        }
+    }
+}
+
+impl From<&TrackPublication> for CallbackPublication {
+    fn from(publication: &TrackPublication) -> Self {
+        match publication {
+            TrackPublication::Local(p) => CallbackPublication::Local(p.clone()),
+            TrackPublication::Remote(p) => CallbackPublication::Remote(p.downgrade()),
+        }
+    }
+}
+
 pub(super) fn set_track(
     inner: &TrackPublicationInner,
     publication: &TrackPublication,
@@ -194,22 +221,25 @@ pub(super) fn set_track(
     if let Some(track) = track.as_ref() {
         info.sid = track.sid();
 
+        // The publication owns this track, which owns these callbacks.
         track.on_muted({
             let events = inner.events.clone();
-            let publication = publication.clone();
+            let publication = CallbackPublication::from(publication);
             move |_| {
+                let Some(publication) = publication.get() else { return };
                 if let Some(on_muted) = events.muted.lock().as_ref() {
-                    on_muted(publication.clone());
+                    on_muted(publication);
                 }
             }
         });
 
         track.on_unmuted({
             let events = inner.events.clone();
-            let publication = publication.clone();
+            let publication = CallbackPublication::from(publication);
             move |_| {
+                let Some(publication) = publication.get() else { return };
                 if let Some(on_unmuted) = events.unmuted.lock().as_ref() {
-                    on_unmuted(publication.clone());
+                    on_unmuted(publication);
                 }
             }
         });
