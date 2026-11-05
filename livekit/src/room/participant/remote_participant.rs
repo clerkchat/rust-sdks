@@ -15,7 +15,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
@@ -58,6 +58,19 @@ struct RemoteInfo {
 pub struct RemoteParticipant {
     inner: Arc<ParticipantInner>,
     remote: Arc<RemoteInfo>,
+}
+
+/// A [`RemoteParticipant`] reference that does not keep it alive.
+#[derive(Clone)]
+pub(super) struct WeakRemoteParticipant {
+    inner: Weak<ParticipantInner>,
+    remote: Weak<RemoteInfo>,
+}
+
+impl WeakRemoteParticipant {
+    pub(super) fn upgrade(&self) -> Option<RemoteParticipant> {
+        Some(RemoteParticipant { inner: self.inner.upgrade()?, remote: self.remote.upgrade()? })
+    }
 }
 
 impl Debug for RemoteParticipant {
@@ -105,6 +118,13 @@ impl RemoteParticipant {
                 capabilities,
             ),
             remote: Arc::new(RemoteInfo { events: Default::default(), auto_subscribe }),
+        }
+    }
+
+    pub(super) fn downgrade(&self) -> WeakRemoteParticipant {
+        WeakRemoteParticipant {
+            inner: Arc::downgrade(&self.inner),
+            remote: Arc::downgrade(&self.remote),
         }
     }
 
@@ -381,22 +401,25 @@ impl RemoteParticipant {
             }
         });
 
+        // Weak: the participant owns this publication, which owns these callbacks.
         publication.on_subscribed({
             let events = self.remote.events.clone();
-            let participant = self.clone();
+            let participant = self.downgrade();
             move |publication, track| {
+                let Some(participant) = participant.upgrade() else { return };
                 if let Some(track_subscribed) = events.track_subscribed.lock().as_ref() {
-                    track_subscribed(participant.clone(), publication, track);
+                    track_subscribed(participant, publication, track);
                 }
             }
         });
 
         publication.on_unsubscribed({
             let events = self.remote.events.clone();
-            let participant = self.clone();
+            let participant = self.downgrade();
             move |publication, track| {
+                let Some(participant) = participant.upgrade() else { return };
                 if let Some(track_unsubscribed) = events.track_unsubscribed.lock().as_ref() {
-                    track_unsubscribed(participant.clone(), publication, track);
+                    track_unsubscribed(participant, publication, track);
                 }
             }
         });
@@ -586,6 +609,14 @@ impl RemoteParticipant {
 
     pub fn is_encrypted(&self) -> bool {
         *self.inner.is_encrypted.read()
+    }
+
+    /// Test-only: returns a probe that reports whether the participant internals have been
+    /// dropped. A reference cycle would silently keep them alive, so lifecycle tests assert on this.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn drop_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || inner.upgrade().is_none()
     }
 
     #[doc(hidden)]

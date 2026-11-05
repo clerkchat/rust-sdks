@@ -133,6 +133,33 @@ impl Participant {
     }
 }
 
+/// How callbacks stored on a participant's own publications refer to that participant.
+#[derive(Clone)]
+enum CallbackParticipant {
+    /// Strong, but not a leak: `close` unpublishes local tracks, which clears these callbacks.
+    Local(LocalParticipant),
+    /// Weak, since a remote participant still present at close never has its publications removed.
+    Remote(WeakRemoteParticipant),
+}
+
+impl CallbackParticipant {
+    fn get(&self) -> Option<Participant> {
+        match self {
+            CallbackParticipant::Local(p) => Some(Participant::Local(p.clone())),
+            CallbackParticipant::Remote(p) => p.upgrade().map(Participant::Remote),
+        }
+    }
+}
+
+impl From<&Participant> for CallbackParticipant {
+    fn from(participant: &Participant) -> Self {
+        match participant {
+            Participant::Local(p) => CallbackParticipant::Local(p.clone()),
+            Participant::Remote(p) => CallbackParticipant::Remote(p.downgrade()),
+        }
+    }
+}
+
 struct ParticipantInfo {
     pub sid: ParticipantSid,
     pub identity: ParticipantIdentity,
@@ -447,9 +474,10 @@ pub(super) fn add_publication(
     let mut tracks = inner.track_publications.write();
     tracks.insert(publication.sid(), publication.clone());
 
+    // The participant owns this publication, which owns these callbacks.
     publication.on_muted({
         let events = inner.events.clone();
-        let participant = participant.clone();
+        let participant = CallbackParticipant::from(participant);
         let rtc_engine = inner.rtc_engine.clone();
         move |publication| {
             if let Some(cb) = events.track_muted.lock().as_ref() {
@@ -468,14 +496,16 @@ pub(super) fn add_publication(
                         }
                     });
                 }
-                cb(participant.clone(), publication);
+                if let Some(participant) = participant.get() {
+                    cb(participant, publication);
+                }
             }
         }
     });
 
     publication.on_unmuted({
         let events = inner.events.clone();
-        let participant = participant.clone();
+        let participant = CallbackParticipant::from(participant);
         let rtc_engine = inner.rtc_engine.clone();
         move |publication| {
             if let Some(cb) = events.track_unmuted.lock().as_ref() {
@@ -494,7 +524,9 @@ pub(super) fn add_publication(
                         }
                     });
                 }
-                cb(participant.clone(), publication);
+                if let Some(participant) = participant.get() {
+                    cb(participant, publication);
+                }
             }
         }
     });

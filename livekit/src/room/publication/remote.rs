@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{Arc, Weak},
+};
 
 use livekit_protocol::{self as proto, AudioTrackFeature, PacketTrailerFeature};
 use parking_lot::{Mutex, RwLock};
@@ -60,6 +63,22 @@ pub struct RemoteTrackPublication {
     remote: Arc<RemoteInner>,
 }
 
+/// A [`RemoteTrackPublication`] reference that does not keep it alive.
+#[derive(Clone)]
+pub(super) struct WeakRemoteTrackPublication {
+    inner: Weak<TrackPublicationInner>,
+    remote: Weak<RemoteInner>,
+}
+
+impl WeakRemoteTrackPublication {
+    pub(super) fn upgrade(&self) -> Option<RemoteTrackPublication> {
+        Some(RemoteTrackPublication {
+            inner: self.inner.upgrade()?,
+            remote: self.remote.upgrade()?,
+        })
+    }
+}
+
 impl Debug for RemoteTrackPublication {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteTrackPublication")
@@ -82,6 +101,21 @@ impl RemoteTrackPublication {
                 events: Default::default(),
             }),
         }
+    }
+
+    pub(super) fn downgrade(&self) -> WeakRemoteTrackPublication {
+        WeakRemoteTrackPublication {
+            inner: Arc::downgrade(&self.inner),
+            remote: Arc::downgrade(&self.remote),
+        }
+    }
+
+    /// Test-only: returns a probe that reports whether the publication internals have been
+    /// dropped. A reference cycle would silently keep them alive, so lifecycle tests assert on this.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn drop_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || inner.upgrade().is_none()
     }
 
     /// This is called by the RemoteParticipant when it successfully subscribe to the track or when
