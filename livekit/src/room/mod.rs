@@ -534,6 +534,8 @@ pub(crate) struct RoomSession {
     handle: AsyncMutex<Option<Handle>>,
     /// Set once the room reaches `Disconnected`, which is final from then on.
     disconnected: AtomicBool,
+    /// Set under the remote participant map's write lock before teardown drains it.
+    closing: AtomicBool,
 }
 
 struct Handle {
@@ -753,6 +755,7 @@ impl Room {
             rpc_server: RpcServerManager::new(),
             handle: Default::default(),
             disconnected: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
         });
         inner.local_participant.set_session(Arc::downgrade(&inner));
 
@@ -808,7 +811,9 @@ impl Room {
                         .collect(),
                 )
             };
-            participant.update_info(pi.clone());
+            if let Some(participant) = participant {
+                participant.update_info(pi.clone());
+            }
         }
 
         // Get the initial states (Can be useful on some usecases, like the FfiServer)
@@ -1018,6 +1023,9 @@ impl Room {
     }
 }
 
+#[cfg(all(test, feature = "__lk-e2e-test"))]
+mod lifecycle_tests;
+
 impl RoomSession {
     async fn room_task(
         self: Arc<Self>,
@@ -1191,8 +1199,25 @@ impl RoomSession {
         Ok(())
     }
 
+    /// Stops remote participant insertion and silently tears down a stable snapshot.
+    fn release_remote_participants(&self) {
+        let participants = {
+            let mut participants = self.remote_participants.write();
+            self.closing.store(true, Ordering::Relaxed);
+            std::mem::take(&mut *participants)
+        };
+        for participant in participants.into_values() {
+            participant.teardown();
+        }
+    }
+
     async fn close(self: &Arc<Self>, reason: DisconnectReason) -> RoomResult<()> {
         let Some(handle) = self.handle.lock().await.take() else { Err(RoomError::AlreadyClosed)? };
+
+        // Run before the first suspension after taking the handle: cancellation cannot retry
+        // close. The map lock rejects late inserts, and each participant serializes teardown
+        // with updates that already hold a clone, so a second drain is unnecessary.
+        self.release_remote_participants();
 
         // remove published tracks
         for (sid, _) in self.local_participant.track_publications().iter() {
@@ -1309,7 +1334,7 @@ impl RoomSession {
                 participants.push(Participant::Remote(remote_participant));
             } else {
                 // Create a new participant
-                let remote_participant = {
+                let Some(remote_participant) = ({
                     let pi = pi.clone();
                     let pi_kind = pi.kind().into();
                     let pi_kind_details = crate::utils::convert_kind_details(&pi.kind_details);
@@ -1331,6 +1356,8 @@ impl RoomSession {
                             .filter_map(|&c| ClientCapability::try_from(c).ok())
                             .collect(),
                     )
+                }) else {
+                    continue;
                 };
 
                 self.dispatcher
@@ -2160,7 +2187,11 @@ impl RoomSession {
         permission: Option<proto::ParticipantPermission>,
         client_protocol: i32,
         capabilities: Vec<ClientCapability>,
-    ) -> RemoteParticipant {
+    ) -> Option<RemoteParticipant> {
+        let mut participants = self.remote_participants.write();
+        if self.closing.load(Ordering::Relaxed) {
+            return None;
+        }
         let participant = RemoteParticipant::new(
             self.rtc_engine.clone(),
             kind,
@@ -2290,9 +2321,8 @@ impl RoomSession {
             }
         });
 
-        let mut participants = self.remote_participants.write();
         participants.insert(identity, participant.clone());
-        participant
+        Some(participant)
     }
 
     /// A participant has disconnected
